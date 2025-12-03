@@ -28,3 +28,8 @@ python -m src.task2.train_llm \
 
 evaluate:
 
+```shell
+python -m src.task2.eval_llm \
+  --ckpt outputs/llm_cv0/checkpoint-epoch5.pt \
+  --val data/dummy_llm/mm_instructions_val_cv0.jsonl
+```

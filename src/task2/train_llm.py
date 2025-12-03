@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import List, Dict, Any
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,9 @@ from peft import LoraConfig, get_peft_model
 from transformers import get_linear_schedule_with_warmup
 
 from .llm_model import ECGQwenForAF, DEFAULT_QWEN_NAME
+
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
 class ECGAFLLMDataset(Dataset):
@@ -201,7 +205,8 @@ def train(
 
         model.train()
 
-        ckpt_path = output_dir / f"checkpoint-epoch{epoch + 1}.pt"
+        time_str = datetime.now().strftime("%Y%m%d-%H%M")
+        ckpt_path = output_dir / f"checkpoint-epoch{epoch + 1}-{time_str}.pt"
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
