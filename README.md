@@ -16,6 +16,15 @@ python -m src.task2.build_llm_dataset --cv 0
 
 fine-tune:
 
+```shell
+export CUDA_VISIBLE_DEVICES=7
+python -m src.task2.train_llm \
+  --cv 0 \
+  --batch-size 4 \
+  --epochs 5 \
+  --grad-accum 8 \
+  --lr 1e-4
+```
 
 evaluate:
 
