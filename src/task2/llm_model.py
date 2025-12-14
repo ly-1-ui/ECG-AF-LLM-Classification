@@ -1,107 +1,126 @@
 import torch
 import torch.nn as nn
+from typing import Optional, List, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
 
+from ..task1.encoder import Mscnn, freeze_module, load_mscnn_checkpoint
 
-DEFAULT_QWEN_NAME = "Qwen/Qwen2-7B-Instruct" 
+DEFAULT_QWEN_NAME = "Qwen/Qwen2-7B-Instruct"
 
 
 class ECGQwenForAF(nn.Module):
-    """
-    Multi-modal model for AF classification with ECG features and Qwen-7B.
-
-    Input:
-        ecg_feat:      [B, ecg_dim]
-        input_ids:     [B, T] token identifiers of instruction (and optionally answer)
-        attention_mask:[B, T] mask for text tokens
-        labels:        [B, T'] language modeling labels for Qwen
-
-    The ECG feature is projected to the LLM hidden size and prepended
-    as the first token embedding.
-    """
-
-    def __init__(self, ecg_dim: int = 256, llm_name: str = DEFAULT_QWEN_NAME):
+    def __init__(
+        self,
+        llm_name: str = DEFAULT_QWEN_NAME,
+        ecg_ch_in: int = 1,
+        ecg_len: int = 3000,
+        ecg_encoder_use_stream2: bool = True,
+        ecg_encoder_stream2_kernel: int = 7,
+        ecg_encoder_ckpt: Optional[str] = None,
+        freeze_encoder: bool = True,
+        ecg_adapter_dim: int = 256,
+        ecg_adapter_dropout: float = 0.0,
+        llm_dtype: torch.dtype = torch.float16,
+        device_map: str = "auto",
+    ):
         super().__init__()
         self.llm_name = llm_name
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_name, trust_remote_code=True)
+        self.llm = AutoModelForCausalLM.from_pretrained(
             llm_name,
+            torch_dtype=llm_dtype,
+            device_map=device_map,
             trust_remote_code=True,
         )
 
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            llm_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
+        self.encoder = Mscnn(
+            ch_in=ecg_ch_in,
+            ch_out=1,  # head unused; we use forward_features()
+            use_stream2=ecg_encoder_use_stream2,
+            stream2_kernel=ecg_encoder_stream2_kernel,
+            input_len=ecg_len,
+        )
+
+        if ecg_encoder_ckpt is not None:
+            load_mscnn_checkpoint(
+                self.encoder,
+                ecg_encoder_ckpt,
+                map_location="cpu",
+                strict=False,
+            )
+
+        if freeze_encoder:
+            freeze_module(self.encoder)
+
+        self.ecg_adapter = nn.Sequential(
+            nn.Linear(self.encoder.feature_dim, ecg_adapter_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=ecg_adapter_dropout) if ecg_adapter_dropout > 0 else nn.Identity(),
         )
 
         hidden_size = self.llm.config.hidden_size
-        self.proj = nn.Linear(ecg_dim, hidden_size)
+        self.proj = nn.Linear(ecg_adapter_dim, hidden_size)
 
-    def forward(
-        self,
-        ecg_feat: torch.Tensor,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        labels: torch.Tensor | None = None,
-    ):
-        """
-        ecg_feat: [B, ecg_dim]
-        input_ids: [B, T]
-        """
+    def forward(self, ecg, input_ids, attention_mask=None, labels=None):
+        inputs_embeds, full_attention_mask = self.prepare_inputs_for_generation(
+            ecg=ecg,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
 
-        device = next(self.parameters()).device
-        ecg_feat = ecg_feat.to(device)
-        input_ids = input_ids.to(device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
+        llm_device = inputs_embeds.device
         if labels is not None:
-            labels = labels.to(device)
+            labels = labels.to(llm_device)
+            pad_ignore = torch.full((labels.size(0), 1), -100, dtype=labels.dtype, device=llm_device)
+            labels = torch.cat([pad_ignore, labels], dim=1)
 
-        llm_dtype = next(self.llm.parameters()).dtype
+        return self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=full_attention_mask,
+            labels=labels,
+        )
 
-        ecg_feat = ecg_feat.to(self.proj.weight.dtype)
-        ecg_emb = self.proj(ecg_feat)                      # [B, H]
-        ecg_emb = ecg_emb.to(llm_dtype).unsqueeze(1)       # [B, 1, H]
+    def prepare_inputs_for_generation(self, ecg, input_ids, attention_mask=None):
+        llm_param = next(self.llm.parameters())
+        llm_device = llm_param.device
+        llm_dtype = llm_param.dtype
 
-        text_emb = self.llm.get_input_embeddings()(input_ids)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(llm_device)
+
+        self.encoder = self.encoder.to(llm_device)
+        self.ecg_adapter = self.ecg_adapter.to(llm_device)
+        self.proj = self.proj.to(llm_device)
+
+        ecg = ecg.to(device=llm_device, dtype=torch.float32)
+        feat = self.encoder.forward_features(ecg)
+        feat = feat.to(self.ecg_adapter[0].weight.dtype)
+        ecg_vec = self.ecg_adapter(feat)
+        ecg_vec = ecg_vec.to(self.proj.weight.dtype)
+        ecg_emb = self.proj(ecg_vec).to(llm_dtype).unsqueeze(1)
+
+        text_emb = self.llm.get_input_embeddings()(input_ids.to(llm_device))
         if text_emb.dtype != llm_dtype:
             text_emb = text_emb.to(llm_dtype)
 
-        inputs_embeds = torch.cat([ecg_emb, text_emb], dim=1)  # [B, 1+T, H]
+        inputs_embeds = torch.cat([ecg_emb, text_emb], dim=1)
 
         if attention_mask is not None:
             ecg_mask = torch.ones(
-                ecg_emb.size(0),
+                inputs_embeds.size(0),
                 1,
                 dtype=attention_mask.dtype,
-                device=attention_mask.device,
+                device=llm_device,
             )
-            attention_mask = torch.cat([ecg_mask, attention_mask], dim=1)
+            full_attention_mask = torch.cat([ecg_mask, attention_mask], dim=1)
+        else:
+            full_attention_mask = None
 
-        if labels is not None:
-            pad_ignore = torch.full(
-                (labels.size(0), 1),
-                -100,
-                dtype=labels.dtype,
-                device=labels.device,
-            )
-            labels = torch.cat([pad_ignore, labels], dim=1)
+        return inputs_embeds, full_attention_mask
 
-        outputs = self.llm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            labels=labels,
-        )
-        return outputs
-
-    def encode_text(
-        self,
-        prompt_texts: list[str],
-        add_special_tokens: bool = True,
-        max_length: int = 256,
-    ):
+    def encode_text(self, prompt_texts: List[str], add_special_tokens: bool = True, max_length: int = 256):
         batch = self.tokenizer(
             prompt_texts,
             return_tensors="pt",
@@ -111,3 +130,26 @@ class ECGQwenForAF(nn.Module):
             add_special_tokens=add_special_tokens,
         )
         return batch["input_ids"], batch["attention_mask"]
+
+
+def apply_lora_to_llm(
+    model: ECGQwenForAF,
+    r: int = 16,
+    alpha: int = 32,
+    dropout: float = 0.05,
+):
+    for p in model.llm.parameters():
+        p.requires_grad = False
+
+    lora_config = LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        target_modules=["q_proj", "v_proj"],
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    model.llm = get_peft_model(model.llm, lora_config)
+    model.llm.print_trainable_parameters()
+    return model

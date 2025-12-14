@@ -12,6 +12,17 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
+'''
+Jsonl format:
+{
+    "file_name": name,
+    "instruction": "请判断这个ECG信号是否有房颤？",
+    "answer": "有房颤。" if label == 1 else "无房颤。",
+}
+
+Features are deprecated in the dataset, and the residual encoder code is dummy.
+'''
+
 def one_hot_to_af_label(one_hot: torch.Tensor) -> int:
     # one_hot: [N, O, A, ~] -> AF = 1 if A else 0
     return int(one_hot[2].item() == 1)
@@ -36,7 +47,7 @@ def build_split(
                 label = one_hot_to_af_label(oh)
                 item = {
                     "file_name": name,
-                    "ecg_feat": feat,
+                    # "ecg_feat": feat,
                     "instruction": "请判断这个ECG信号是否有房颤？",
                     "answer": "有房颤。" if label == 1 else "无房颤。",
                 }

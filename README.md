@@ -18,18 +18,24 @@ fine-tune:
 
 ```shell
 export CUDA_VISIBLE_DEVICES=7
-python -m src.task2.train_llm \
-  --cv 0 \
-  --batch-size 4 \
+
+python -m src.task2.train \
+  --data-root /home/WangQingyang/Documents/ECG-AF-LLM-Classification/data/llm_cv0 \
+  --mat-dir /home/WangQingyang/Documents/ECG-AF-LLM-Classification/data/training2017 \
+  --encoder-ckpt /home/WangQingyang/Documents/ECG-AF-LLM-Classification/outputs/mscnn/model.pth \
+  --output-dir /home/WangQingyang/Documents/ECG-AF-LLM-Classification/outputs/llm_cv0 \
+  --batch-size 64 \
   --epochs 5 \
-  --grad-accum 8 \
-  --lr 1e-4
+  --cv 0 \
+  --ecg-len 2400
 ```
 
 evaluate:
 
 ```shell
-python -m src.task2.eval_llm \
-  --ckpt outputs/llm_cv0/checkpoint-epoch5.pt \
-  --val data/dummy_llm/mm_instructions_val_cv0.jsonl
+python -m src.task2.eval \
+  --ckpt outputs/llm_cv0/checkpoint-epoch5-20251212-1825.pt \
+  --val data/llm_cv0/mm_instructions_val_cv0.jsonl \
+  --mat-dir data/training2017 \
+  --encoder-ckpt outputs/mscnn/model.pth
 ```
