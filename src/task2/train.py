@@ -1,7 +1,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 import numpy as np
@@ -54,17 +54,6 @@ def _ecg_preprocess(
 
 
 class ECGAFLLMDataset(Dataset):
-    """
-    JSONL item format:
-    {
-        "file_name": "...",
-        "instruction": "...",
-        "answer": "有房颤。" | "无房颤。"
-    }
-
-    Loads raw ECG from .mat, preprocesses to [1, L], and builds prompt/full text.
-    """
-
     def __init__(
         self,
         jsonl_path: str,
@@ -97,7 +86,7 @@ class ECGAFLLMDataset(Dataset):
         mat_path = self.mat_dir / f"{file_name}.mat"
         if not mat_path.exists():
             raise FileNotFoundError(f"ECG mat not found: {mat_path}")
-        data = io.loadmat(str(mat_path))["val"]  # shape [1, N] typically
+        data = io.loadmat(str(mat_path))["val"]
         sig = np.asarray(data).reshape(-1)
         return sig
 
@@ -110,7 +99,7 @@ class ECGAFLLMDataset(Dataset):
             downsample=self.downsample,
             random_crop=self.is_train,
         )
-        ecg = torch.from_numpy(sig).unsqueeze(0)  # [1, L]
+        ecg = torch.from_numpy(sig).unsqueeze(0)
 
         prompt = f"{it['instruction']}\n答："
         full_text = f"{prompt}{it['answer']}"
@@ -120,7 +109,7 @@ class ECGAFLLMDataset(Dataset):
 
 def make_collate_fn(tokenizer, max_length: int = 256):
     def collate_fn(batch: List[Dict[str, Any]]):
-        ecg = torch.stack([b["ecg"] for b in batch], dim=0)  # [B, 1, L]
+        ecg = torch.stack([b["ecg"] for b in batch], dim=0)
         prompts = [b["prompt"] for b in batch]
         texts = [b["text"] for b in batch]
 
@@ -134,8 +123,6 @@ def make_collate_fn(tokenizer, max_length: int = 256):
         input_ids = enc_full["input_ids"]
         attention_mask = enc_full["attention_mask"]
 
-        # Mask loss on prompt part; only supervise answer tokens.
-        # We compute prompt lengths (with same tokenizer settings but no padding needed).
         enc_prompt = tokenizer(
             prompts,
             return_tensors="pt",
@@ -143,14 +130,11 @@ def make_collate_fn(tokenizer, max_length: int = 256):
             truncation=True,
             max_length=max_length,
         )
-        prompt_ids = enc_prompt["input_ids"]
         prompt_attn = enc_prompt["attention_mask"]
-        prompt_lens = prompt_attn.sum(dim=1)  # [B]
+        prompt_lens = prompt_attn.sum(dim=1)
 
         labels = input_ids.clone()
-        # Ignore padding
         labels[attention_mask == 0] = -100
-        # Ignore prompt tokens
         for i, plen in enumerate(prompt_lens.tolist()):
             plen = int(plen)
             labels[i, :plen] = -100
@@ -158,6 +142,12 @@ def make_collate_fn(tokenizer, max_length: int = 256):
         return ecg, input_ids, attention_mask, labels
 
     return collate_fn
+
+
+def get_trainable_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    trainable_names = {n for n, p in model.named_parameters() if p.requires_grad}
+    full_sd = model.state_dict()
+    return {k: v.detach().cpu() for k, v in full_sd.items() if k in trainable_names}
 
 
 def train(
@@ -177,6 +167,7 @@ def train(
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
+    resume: Optional[str] = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -236,14 +227,36 @@ def train(
         num_training_steps=max_train_steps,
     )
 
+    start_epoch = 0
+    global_step = 0
+
+    if resume is not None:
+        ckpt = torch.load(resume, map_location="cpu", weights_only=True)
+
+        if "trainable_state_dict" in ckpt:
+            model.load_state_dict(ckpt["trainable_state_dict"], strict=False)
+        elif "model_state_dict" in ckpt:
+            # old huge checkpoints (may OOM when loading) - kept for compatibility
+            model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        else:
+            raise KeyError("Checkpoint missing 'trainable_state_dict' or 'model_state_dict'.")
+
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = int(ckpt.get("epoch", 0))
+        global_step = int(ckpt.get("global_step", 0))
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    global_step = 0
     model.train()
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         total_loss = 0.0
+        token_correct = 0
+        token_total = 0
 
         for step, batch in enumerate(train_loader):
             ecg, input_ids, attention_mask, labels = batch
@@ -297,17 +310,28 @@ def train(
 
         model.train()
 
-        time_str = datetime.now().strftime("%Y%m%d-%H%M")
-        ckpt_path = output_dir / f"checkpoint-epoch{epoch + 1}-{time_str}.pt"
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "epoch": epoch + 1,
-                "global_step": global_step,
-            },
-            ckpt_path,
-        )
-        print(f"Saved checkpoint to {ckpt_path}")
+        if (epoch + 1) % 5 == 0 or (epoch + 1) == num_epochs:
+            time_str = datetime.now().strftime("%Y%m%d-%H%M")
+            ckpt_path = output_dir / f"checkpoint-epoch{epoch + 1}-{time_str}.pt"
+            torch.save(
+                {
+                    "trainable_state_dict": get_trainable_state_dict(model),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "meta": {
+                        "llm_name": llm_name,
+                        "ecg_len": ecg_len,
+                        "downsample": downsample,
+                        "lora_r": lora_r,
+                        "lora_alpha": lora_alpha,
+                        "lora_dropout": lora_dropout,
+                    },
+                },
+                ckpt_path,
+            )
+            print(f"Saved checkpoint to {ckpt_path}")
 
 
 def parse_args():
@@ -352,6 +376,7 @@ def parse_args():
     parser.add_argument("--lora-dropout", type=float, default=0.05)
 
     parser.add_argument("--llm-name", type=str, default=DEFAULT_QWEN_NAME)
+    parser.add_argument("--resume", type=str, default=None)
 
     return parser.parse_args()
 
@@ -360,7 +385,8 @@ if __name__ == "__main__":
     args = parse_args()
 
     data_root = Path(args.data_root)
-    train_path = data_root / f"mm_instructions_train_cv{args.cv}.jsonl"
+    # train_path = data_root / f"mm_instructions_train_cv{args.cv}.jsonl"
+    train_path = data_root / f"mm_instructions_train_cv{args.cv}_posx10.jsonl"
     val_path = data_root / f"mm_instructions_val_cv{args.cv}.jsonl"
 
     train(
@@ -380,4 +406,5 @@ if __name__ == "__main__":
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        resume=args.resume,
     )

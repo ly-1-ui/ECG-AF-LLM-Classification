@@ -8,10 +8,14 @@ conda env create -f environment.yml
 conda activate ecg
 ```
 
-generate the dataset:
+generate and balance the dataset:
 
 ```shell
 python -m src.task2.build_llm_dataset --cv 0
+python -m src.task2.balance_llm_dataset \
+  --input data/llm_cv0/mm_instructions_train_cv0.jsonl \
+  --output data/llm_cv0/mm_instructions_train_cv0_posx10.jsonl \
+  --factor 10
 ```
 
 fine-tune:
@@ -25,17 +29,18 @@ python -m src.task2.train \
   --encoder-ckpt /home/WangQingyang/Documents/ECG-AF-LLM-Classification/outputs/mscnn/model.pth \
   --output-dir /home/WangQingyang/Documents/ECG-AF-LLM-Classification/outputs/llm_cv0 \
   --batch-size 64 \
-  --epochs 5 \
+  --epochs 10 \
   --cv 0 \
-  --ecg-len 2400
+  --resume outputs/llm_cv0/checkpoint-epoch1-20251214-1606.pt
 ```
 
 evaluate:
 
 ```shell
 python -m src.task2.eval \
-  --ckpt outputs/llm_cv0/checkpoint-epoch5-20251212-1825.pt \
-  --val data/llm_cv0/mm_instructions_val_cv0.jsonl \
+  --ckpt outputs/llm_cv0/checkpoint-epoch5-20251214-1551.pt \
+  --val data/llm_cv0/mm_instructions_eval_cv0.jsonl \
   --mat-dir data/training2017 \
   --encoder-ckpt outputs/mscnn/model.pth
 ```
+

@@ -79,8 +79,15 @@ def collate_fn(batch, tokenizer, max_length: int = 256):
     )
 
 def load_checkpoint(model: ECGQwenForAF, ckpt_path: str) -> ECGQwenForAF:
-    state = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(state["model_state_dict"], strict=False)
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+
+    if "trainable_state_dict" in state:
+        model.load_state_dict(state["trainable_state_dict"], strict=False)
+    elif "model_state_dict" in state:
+        model.load_state_dict(state["model_state_dict"], strict=False)
+    else:
+        raise KeyError("Checkpoint missing 'trainable_state_dict' or 'model_state_dict'.")
+
     return model
 
 def extract_label_from_text(text: str) -> int:
@@ -159,11 +166,16 @@ def evaluate(
 
     for idx, (ecg, input_ids, attn_mask, gt_answers, prompts) in enumerate(loader):
         with torch.no_grad():
+            ecg = ecg.to(device)
+            input_ids = input_ids.to(device)
+            attn_mask = attn_mask.to(device)
+
             inputs_embeds, full_attention_mask = model.prepare_inputs_for_generation(
                 ecg=ecg,
                 input_ids=input_ids,
                 attention_mask=attn_mask,
             )
+            full_attention_mask = full_attention_mask.to(device)
 
             generated_ids = model.llm.generate(
                 inputs_embeds=inputs_embeds,
