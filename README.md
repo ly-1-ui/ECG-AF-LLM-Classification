@@ -29,7 +29,7 @@ python -m src.task2.train \
   --encoder-ckpt /home/WangQingyang/Documents/ECG-AF-LLM-Classification/outputs/mscnn/model.pth \
   --output-dir /home/WangQingyang/Documents/ECG-AF-LLM-Classification/outputs/llm_cv0 \
   --batch-size 64 \
-  --epochs 1 \
+  --epochs 5 \
   --cv 0 \
   --lr 1e-4
   # --resume outputs/llm_cv0/checkpoint-epoch140-20251214-1957.pt
@@ -39,7 +39,7 @@ evaluate:
 
 ```shell
 python -m src.task2.eval \
-  --ckpt outputs/llm_cv0/checkpoint-epoch110-20251214-1803.pt \
+  --ckpt outputs/llm_cv0/checkpoint-epoch5-20251216-2104.pt \
   --val data/llm_cv0/mm_instructions_train_cv0_100.jsonl \
   --mat-dir data/training2017 \
   --encoder-ckpt outputs/mscnn/model.pth

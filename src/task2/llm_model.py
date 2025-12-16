@@ -21,11 +21,15 @@ class ECGQwenForAF(nn.Module):
         freeze_encoder: bool = True,
         ecg_adapter_dim: int = 256,
         ecg_adapter_dropout: float = 0.0,
+        ecg_token_count: int = 16,
         llm_dtype: torch.dtype = torch.float16,
         device_map: str = "auto",
     ):
         super().__init__()
         self.llm_name = llm_name
+        self.ecg_token_count = int(ecg_token_count)
+        if self.ecg_token_count < 1:
+            raise ValueError("ecg_token_count must be >= 1")
 
         self.tokenizer = AutoTokenizer.from_pretrained(llm_name, trust_remote_code=True)
         self.llm = AutoModelForCausalLM.from_pretrained(
@@ -61,7 +65,8 @@ class ECGQwenForAF(nn.Module):
         )
 
         hidden_size = self.llm.config.hidden_size
-        self.proj = nn.Linear(ecg_adapter_dim, hidden_size)
+        self.hidden_size = hidden_size
+        self.proj = nn.Linear(ecg_adapter_dim, hidden_size * self.ecg_token_count)
 
     def forward(self, ecg, input_ids, attention_mask=None, labels=None):
         inputs_embeds, full_attention_mask = self.prepare_inputs_for_generation(
@@ -73,7 +78,12 @@ class ECGQwenForAF(nn.Module):
         llm_device = inputs_embeds.device
         if labels is not None:
             labels = labels.to(llm_device)
-            pad_ignore = torch.full((labels.size(0), 1), -100, dtype=labels.dtype, device=llm_device)
+            pad_ignore = torch.full(
+                (labels.size(0), self.ecg_token_count),
+                -100,
+                dtype=labels.dtype,
+                device=llm_device,
+            )
             labels = torch.cat([pad_ignore, labels], dim=1)
 
         return self.llm(
@@ -99,7 +109,8 @@ class ECGQwenForAF(nn.Module):
         feat = feat.to(self.ecg_adapter[0].weight.dtype)
         ecg_vec = self.ecg_adapter(feat)
         ecg_vec = ecg_vec.to(self.proj.weight.dtype)
-        ecg_emb = self.proj(ecg_vec).to(llm_dtype).unsqueeze(1)
+        ecg_emb = self.proj(ecg_vec).to(llm_dtype)
+        ecg_emb = ecg_emb.view(ecg_emb.size(0), self.ecg_token_count, self.hidden_size)
 
         text_emb = self.llm.get_input_embeddings()(input_ids.to(llm_device))
         if text_emb.dtype != llm_dtype:
@@ -110,7 +121,7 @@ class ECGQwenForAF(nn.Module):
         if attention_mask is not None:
             ecg_mask = torch.ones(
                 inputs_embeds.size(0),
-                1,
+                self.ecg_token_count,
                 dtype=attention_mask.dtype,
                 device=llm_device,
             )

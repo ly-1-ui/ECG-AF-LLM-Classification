@@ -422,7 +422,7 @@ def train(
         )
         model.train()
 
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == num_epochs:
+        if (epoch + 1) % 1 == 0 or (epoch + 1) == num_epochs:
             time_str = datetime.now().strftime("%Y%m%d-%H%M")
             ckpt_path = output_dir / f"checkpoint-epoch{epoch + 1}-{time_str}.pt"
             torch.save(
