@@ -57,7 +57,7 @@ class EvalDataset(Dataset):
         ecg = torch.from_numpy(sig).unsqueeze(0)
         return {"ecg": ecg, "prompt": it["prompt"], "gt_answer": it["gt_answer"]}
 
-def collate_fn(batch, tokenizer, max_length: int = 256):
+def collate_fn(batch, tokenizer, max_length: int = 512):
     ecg = torch.stack([b["ecg"] for b in batch], dim=0)
     prompts = [b["prompt"] for b in batch]
 
@@ -127,7 +127,7 @@ def evaluate(
     encoder_ckpt: Optional[str] = None,
     ecg_len: int = 2400,
     downsample: int = 3,
-    max_length: int = 256,
+    max_length: int = 512,
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
@@ -229,7 +229,7 @@ def parse_args():
     parser.add_argument("--llm-name", type=str, default=DEFAULT_QWEN_NAME)
     parser.add_argument("--ecg-len", type=int, default=2400)
     parser.add_argument("--downsample", type=int, default=3)
-    parser.add_argument("--max-length", type=int, default=256)
+    parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)

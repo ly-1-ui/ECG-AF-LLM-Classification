@@ -117,6 +117,26 @@ class ECGQwenForAF(nn.Module):
             full_attention_mask = torch.cat([ecg_mask, attention_mask], dim=1)
         else:
             full_attention_mask = None
+            
+        # DEBUG
+        # if not hasattr(self, "_dbg_ecg_once"):
+        #     self._dbg_ecg_once = True
+            
+        #     x = ecg_emb[0]  # [1, D]
+        #     print("ecg_embeds:", x.shape)
+        #     print("mean/std:", float(x.mean()), float(x.std()))
+        #     print("abs-mean:", float(x.abs().mean()))
+        #     print("l2-norm:", float(x.norm(p=2)))
+
+        #     print("text_len:", int(attention_mask[0].sum().item()))
+        #     print("inputs_embeds_len:", int(inputs_embeds.shape[1]))
+        #     print("full_mask_len:", int(full_attention_mask.shape[1]))
+
+        #     print("ecg_len:", int(ecg_emb.shape[1]))
+
+        #     print("full_mask_first_16:", full_attention_mask[0, :16].int().tolist())
+        #     print("full_mask_last_16:", full_attention_mask[0, -16:].int().tolist())
+        #     print("=" * 60, flush=True)
 
         return inputs_embeds, full_attention_mask
 
