@@ -131,6 +131,7 @@ def evaluate(
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
+    ecg_token_count: int = 16,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -140,6 +141,7 @@ def evaluate(
         ecg_len=ecg_len,
         ecg_encoder_ckpt=encoder_ckpt,
         freeze_encoder=True,
+        ecg_token_count=ecg_token_count,
     )
     model = apply_lora_to_llm(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
     model = load_checkpoint(model, ckpt_path)
@@ -233,6 +235,7 @@ def parse_args():
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--ecg_token_count", type=int, default=16)
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -249,4 +252,5 @@ if __name__ == "__main__":
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        ecg_token_count=args.ecg_token_count,
     )

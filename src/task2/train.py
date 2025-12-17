@@ -135,25 +135,6 @@ def make_collate_fn(tokenizer, max_length: int = 512):
         for i, plen in enumerate(prompt_lens.tolist()):
             plen = int(plen)
             labels[i, :plen] = -100
-            
-        # DEBUG
-        # if not printed:
-        #     printed = True
-        #     # decode input_ids
-        #     print("=== DEBUG: decoded input_ids ===")
-        #     print(tokenizer.decode(input_ids[0]))
-
-        #     # decode labels (answer)
-        #     label_ids = labels[0]
-        #     answer_token_ids = label_ids[label_ids != -100]
-        #     print("=== DEBUG: decoded labels (answer only) ===")
-        #     print(tokenizer.decode(answer_token_ids))
-
-        #     # also print raw answer text for comparison
-        #     print("=== DEBUG: raw answer ===")
-        #     print(texts[0])
-
-        #     print("=" * 60, flush=True)
 
         return ecg, input_ids, attention_mask, labels
 
@@ -176,15 +157,31 @@ def train(
     ecg_len: int = 2400,
     downsample: int = 3,
     batch_size: int = 4,
-    num_epochs: int = 3,
     lr: float = 1e-4,
     max_length: int = 512,
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
     resume: Optional[str] = None,
+    ecg_token_count: int = 16,
+    stage1_epochs: Optional[int] = None,
+    stage2_epochs: int = 0,
+    stage1_lr: Optional[float] = None,
+    stage2_adapter_lr: Optional[float] = None,
+    stage2_lora_lr: Optional[float] = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    stage1_epochs = max(stage1_epochs, 0)
+    stage2_epochs = max(stage2_epochs, 0)
+    total_epochs = stage1_epochs + stage2_epochs
+
+    if stage1_lr is None:
+        stage1_lr = lr
+    if stage2_adapter_lr is None:
+        stage2_adapter_lr = stage1_lr * 0.1
+    if stage2_lora_lr is None:
+        stage2_lora_lr = stage1_lr
 
     model = ECGQwenForAF(
         llm_name=llm_name,
@@ -192,8 +189,10 @@ def train(
         ecg_len=ecg_len,
         ecg_encoder_ckpt=encoder_ckpt,
         freeze_encoder=True,
+        ecg_token_count=ecg_token_count,
     )
-    model = apply_lora_to_llm(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+    for p in model.llm.parameters():
+        p.requires_grad = False
     model.to(device)
 
     tokenizer = model.tokenizer
@@ -230,21 +229,28 @@ def train(
         pin_memory=torch.cuda.is_available(),
     )
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+    adapter_params = list(model.ecg_adapter.parameters()) + list(model.proj.parameters())
 
-    num_update_steps_per_epoch = max(len(train_loader), 1)
-    max_train_steps = num_epochs * num_update_steps_per_epoch
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(0.1 * max_train_steps),
-        num_training_steps=max_train_steps,
-    )
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    start_epoch = 0
+    global_epoch = 0
     global_step = 0
+    stage1_start_epoch = 0
+    stage2_start_epoch = 0
+    resume_stage = None
+    resume_opt_state = None
+    resume_sched_state = None
+    lora_initialized = False
+
     if resume is not None:
         ckpt = torch.load(resume, map_location="cpu", weights_only=True)
+        resume_stage = int(ckpt.get("stage", 1))
+        if resume_stage == 2 and not lora_initialized:
+            model = apply_lora_to_llm(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+            model.to(device)
+            lora_initialized = True
+
         if "trainable_state_dict" in ckpt:
             model.load_state_dict(ckpt["trainable_state_dict"], strict=False)
         elif "model_state_dict" in ckpt:
@@ -252,149 +258,60 @@ def train(
         else:
             raise KeyError("Checkpoint missing 'trainable_state_dict' or 'model_state_dict'.")
 
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-
-        start_epoch = int(ckpt.get("epoch", 0))
+        global_epoch = int(ckpt.get("global_epoch", ckpt.get("epoch", 0)))
         global_step = int(ckpt.get("global_step", 0))
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+        if resume_stage == 1:
+            stage1_start_epoch = int(ckpt.get("stage_epoch", ckpt.get("epoch", 0)))
+            stage2_start_epoch = 0
+        elif resume_stage == 2:
+            stage1_start_epoch = stage1_epochs
+            stage2_start_epoch = int(ckpt.get("stage_epoch", 0))
+        else:
+            stage1_start_epoch = int(ckpt.get("stage_epoch", 0))
+            stage2_start_epoch = 0
 
-    model.train()
-    for epoch in range(start_epoch, num_epochs):
-        total_loss = 0.0
-        did_step = 0
-        zero_sup_batches = 0
-        ran_debug = False
+        resume_opt_state = ckpt.get("optimizer_state_dict")
+        resume_sched_state = ckpt.get("scheduler_state_dict")
 
-        for step, batch in enumerate(train_loader):
-            ecg, input_ids, attention_mask, labels = batch
-            ecg = ecg.to(device, non_blocking=True)
-            input_ids = input_ids.to(device, non_blocking=True)
-            attention_mask = attention_mask.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+    stage1_start_epoch = min(stage1_start_epoch, stage1_epochs)
+    stage2_start_epoch = min(stage2_start_epoch, stage2_epochs)
 
-            sup_mask = (labels != -100)  # [B, T_text]
-            sup_tokens = int(sup_mask.sum().item())
-            if sup_tokens == 0:
-                zero_sup_batches += 1
-            
-            # DEBUG
-            # if epoch == start_epoch and step == 0:
-            #     for i in range(min(4, labels.size(0))):
-            #         ans_ids = labels[i][labels[i] != -100]
-            #         print(f"[DEBUG] gt supervised text[{i}]:", tokenizer.decode(ans_ids))
-            #         print(f"[DEBUG] gt supervised ids[{i}]:", ans_ids.tolist())
-                
-            # DEBUG
-            # if epoch == start_epoch and step == 0:
-                # per_sample = sup_mask.sum(dim=1).tolist()
-                # print(f"[DEBUG] supervised tokens per sample (first batch): {per_sample}", flush=True)
-                # print(
-                #     f"[DEBUG] supervised tokens total={sup_tokens} | "
-                #     f"min={min(per_sample)} max={max(per_sample)} avg={sum(per_sample)/max(len(per_sample),1):.2f}",
-                #     flush=True,
-                # )
+    def build_scheduler(optimizer, stage_epoch_count: int):
+        num_update_steps_per_epoch = max(len(train_loader), 1)
+        max_train_steps = stage_epoch_count * num_update_steps_per_epoch
+        if max_train_steps == 0:
+            max_train_steps = 1
+        num_warmup_steps = int(0.1 * max_train_steps)
+        return get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=max_train_steps,
+        )
 
-            # DEBUG
-            # if (not ran_debug) and sup_tokens > 0:
-            #     ran_debug = True
-            #     model.eval()
-            #     with torch.no_grad():
-            #         out_real = model(
-            #             ecg=ecg,
-            #             input_ids=input_ids,
-            #             attention_mask=attention_mask,
-            #             labels=labels,
-            #         )
-            #         out_zero = model(
-            #             ecg=torch.zeros_like(ecg),
-            #             input_ids=input_ids,
-            #             attention_mask=attention_mask,
-            #             labels=labels,
-            #         )
+    def run_stage(stage_idx: int, start_epoch: int, max_epoch: int, optimizer, scheduler):
+        nonlocal global_epoch, global_step
+        if max_epoch == 0 or start_epoch >= max_epoch:
+            return
 
-            #         diff = (out_real.logits - out_zero.logits).abs()  # [B, T_total, V]
-            #         sup_text = (labels != -100)  # [B, T_text]
+        stage_name = f"stage{stage_idx}"
+        model.train()
 
-            #         pad = torch.zeros((sup_text.size(0), 1), dtype=torch.bool, device=sup_text.device)
-            #         sup_total = torch.cat([pad, sup_text], dim=1)
+        for local_epoch in range(start_epoch, max_epoch):
+            total_loss = 0.0
+            did_step = 0
+            zero_sup_batches = 0
 
-            #         sup_shift = sup_total[:, 1:]     # [B, T_total-1]
-            #         diff_shift = diff[:, :-1, :]     # [B, T_total-1, V]
-
-            #         diff_per_pos = diff_shift.mean(dim=-1)  # [B, T_total-1]
-            #         diff_sup = diff_per_pos[sup_shift].mean().item() if sup_shift.any() else float("nan")
-
-            #         idxs = sup_shift[0].nonzero(as_tuple=True)[0]
-            #         diff_last = diff_per_pos[0, int(idxs[-1].item())].item() if idxs.numel() > 0 else float("nan")
-
-            #         print(
-            #             f"[DEBUG epoch {epoch+1}] loss_real={float(out_real.loss):.6f} "
-            #             f"loss_zero={float(out_zero.loss):.6f} "
-            #             f"diff_sup={diff_sup:.6e} diff_last={diff_last:.6e}",
-            #             flush=True,
-            #         )
-            #     model.train()
-
-            outputs = model(
-                ecg=ecg,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-            )
-            loss = outputs.loss
-            loss.backward()
-            
-            # DEBUG
-            # if (step == 0) and (epoch == start_epoch):
-            #     with torch.no_grad():
-            #         logits = outputs.logits  # [B, T_total, V]
-            #         # pad one False for ECG then shift
-            #         sup_text = (labels != -100)
-            #         pad = torch.zeros((sup_text.size(0), 1), dtype=torch.bool, device=sup_text.device)
-            #         sup_total = torch.cat([pad, sup_text], dim=1)
-            #         sup_shift = sup_total[:, 1:]
-            #         pred_ids = logits[:, :-1, :].argmax(dim=-1)  # [B, T_total-1]
-
-            #         # show first sample's predicted supervised tokens
-            #         idxs = sup_shift[0].nonzero(as_tuple=True)[0]
-            #         p = pred_ids[0, idxs]
-            #         print("[DEBUG] pred supervised tokens:", model.tokenizer.decode(p), flush=True)
-
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-
-            global_step += 1
-            did_step += 1
-            total_loss += float(loss.item())
-
-        avg_train_loss = total_loss / max(len(train_loader), 1)
-
-        # DEBUG
-        if did_step == 0:
-            print("WARNING: optimizer.step() never called in this epoch. Check len(train_loader).", flush=True)
-        if zero_sup_batches > 0:
-            print(
-                f"WARNING: {zero_sup_batches}/{len(train_loader)} batches have 0 supervised tokens "
-                f"(all labels=-100). Try increasing max_length.",
-                flush=True,
-            )
-
-        model.eval()
-        val_loss = 0.0
-        zero_loss = 0.0
-        with torch.no_grad():
-            for batch in val_loader:
+            for batch in train_loader:
                 ecg, input_ids, attention_mask, labels = batch
                 ecg = ecg.to(device, non_blocking=True)
                 input_ids = input_ids.to(device, non_blocking=True)
                 attention_mask = attention_mask.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
+
+                sup_mask = (labels != -100)
+                if int(sup_mask.sum().item()) == 0:
+                    zero_sup_batches += 1
 
                 outputs = model(
                     ecg=ecg,
@@ -402,48 +319,132 @@ def train(
                     attention_mask=attention_mask,
                     labels=labels,
                 )
-                # check 1
-                zero_outputs = model(
-                    ecg=torch.zeros_like(ecg), 
-                    input_ids=input_ids, 
-                    attention_mask=attention_mask, 
-                    labels=labels
+                loss = outputs.loss
+                loss.backward()
+
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1
+                did_step += 1
+                total_loss += float(loss.item())
+
+            avg_train_loss = total_loss / max(len(train_loader), 1)
+
+            if did_step == 0:
+                print("WARNING: optimizer.step() never called in this epoch. Check len(train_loader).", flush=True)
+            if zero_sup_batches > 0:
+                print(
+                    f"WARNING: {zero_sup_batches}/{len(train_loader)} batches have 0 supervised tokens "
+                    f"(all labels=-100). Try increasing max_length.",
+                    flush=True,
                 )
 
-                val_loss += outputs.loss.item()
-                zero_loss += zero_outputs.loss.item() # DEBUG
+            model.eval()
+            val_loss = 0.0
+            zero_loss = 0.0
+            with torch.no_grad():
+                for batch in val_loader:
+                    ecg, input_ids, attention_mask, labels = batch
+                    ecg = ecg.to(device, non_blocking=True)
+                    input_ids = input_ids.to(device, non_blocking=True)
+                    attention_mask = attention_mask.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
 
-        avg_val_loss = val_loss / max(len(val_loader), 1)
-        avg_zero_loss = zero_loss / max(len(val_loader), 1)
-        print(
-            f"Epoch {epoch + 1}/{num_epochs} | "
-            f"train_loss={avg_train_loss:.4f} | val_loss={avg_val_loss:.4f}"
-            f" | zero_loss{avg_zero_loss:.4f}"
-        )
-        model.train()
+                    outputs = model(
+                        ecg=ecg,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    zero_outputs = model(
+                        ecg=torch.zeros_like(ecg),
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
 
-        if (epoch + 1) % 1 == 0 or (epoch + 1) == num_epochs:
-            time_str = datetime.now().strftime("%Y%m%d-%H%M")
-            ckpt_path = output_dir / f"checkpoint-epoch{epoch + 1}-{time_str}.pt"
-            torch.save(
-                {
-                    "trainable_state_dict": get_trainable_state_dict(model),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "epoch": epoch + 1,
-                    "global_step": global_step,
-                    "meta": {
-                        "llm_name": llm_name,
-                        "ecg_len": ecg_len,
-                        "downsample": downsample,
-                        "lora_r": lora_r,
-                        "lora_alpha": lora_alpha,
-                        "lora_dropout": lora_dropout,
-                    },
-                },
-                ckpt_path,
+                    val_loss += outputs.loss.item()
+                    zero_loss += zero_outputs.loss.item()
+
+            avg_val_loss = val_loss / max(len(val_loader), 1)
+            avg_zero_loss = zero_loss / max(len(val_loader), 1)
+            overall_epoch = global_epoch + 1
+            total_epoch_denom = max(total_epochs, 1)
+            stage_epoch_idx = local_epoch + 1
+            print(
+                f"[{stage_name}] Epoch {overall_epoch}/{total_epoch_denom} (stage {stage_epoch_idx}/{max_epoch}) | "
+                f"train_loss={avg_train_loss:.4f} | val_loss={avg_val_loss:.4f} | zero_loss{avg_zero_loss:.4f}"
             )
-            print(f"Saved checkpoint to {ckpt_path}")
+            model.train()
+
+            time_str = datetime.now().strftime("%Y%m%d-%H%M")
+            ckpt_path = output_dir / (
+                f"checkpoint-{stage_name}-epoch{overall_epoch}-{ecg_token_count}token-{time_str}.pt"
+            )
+            if stage_idx > 1:
+                torch.save(
+                    {
+                        "stage": stage_idx,
+                        "stage_epoch": stage_epoch_idx,
+                        "epoch": overall_epoch,
+                        "global_epoch": overall_epoch,
+                        "global_step": global_step,
+                        "trainable_state_dict": get_trainable_state_dict(model),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "meta": {
+                            "llm_name": llm_name,
+                            "ecg_len": ecg_len,
+                            "downsample": downsample,
+                            "lora_r": lora_r,
+                            "lora_alpha": lora_alpha,
+                            "lora_dropout": lora_dropout,
+                            "stage1_epochs": stage1_epochs,
+                            "stage2_epochs": stage2_epochs,
+                            "stage1_lr": stage1_lr,
+                            "stage2_adapter_lr": stage2_adapter_lr,
+                            "stage2_lora_lr": stage2_lora_lr,
+                        },
+                    },
+                    ckpt_path,
+                )
+                print(f"Saved checkpoint to {ckpt_path}")
+
+            global_epoch += 1
+
+    # Stage 1: only ECG adapter/proj without LoRA
+    if stage1_epochs > 0:
+        stage1_optimizer = torch.optim.AdamW(adapter_params, lr=stage1_lr)
+        stage1_scheduler = build_scheduler(stage1_optimizer, stage1_epochs)
+        if resume_stage == 1 and resume_opt_state is not None:
+            stage1_optimizer.load_state_dict(resume_opt_state)
+        if resume_stage == 1 and resume_sched_state is not None:
+            stage1_scheduler.load_state_dict(resume_sched_state)
+        run_stage(1, stage1_start_epoch, stage1_epochs, stage1_optimizer, stage1_scheduler)
+
+    # Stage 2: enable LoRA and train with smaller adapter LR
+    if stage2_epochs > 0:
+        if not lora_initialized:
+            model = apply_lora_to_llm(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+            model.to(device)
+            lora_initialized = True
+
+        lora_params = [p for p in model.llm.parameters() if p.requires_grad]
+        param_groups = []
+        if adapter_params:
+            param_groups.append({"params": adapter_params, "lr": stage2_adapter_lr})
+        if lora_params:
+            param_groups.append({"params": lora_params, "lr": stage2_lora_lr})
+
+        stage2_optimizer = torch.optim.AdamW(param_groups)
+        stage2_scheduler = build_scheduler(stage2_optimizer, stage2_epochs)
+        if resume_stage == 2 and resume_opt_state is not None:
+            stage2_optimizer.load_state_dict(resume_opt_state)
+        if resume_stage == 2 and resume_sched_state is not None:
+            stage2_scheduler.load_state_dict(resume_sched_state)
+        run_stage(2, stage2_start_epoch, stage2_epochs, stage2_optimizer, stage2_scheduler)
 
 
 def parse_args():
@@ -470,8 +471,17 @@ def parse_args():
         default=str(Path(__file__).resolve().parents[2] / "outputs" / "llm_cv0"),
     )
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--stage1-epochs", type=int, default=None,
+                        help="Number of epochs for stage 1 (defaults to --epochs if unset)")
+    parser.add_argument("--stage2-epochs", type=int, default=0,
+                        help="Number of epochs for stage 2 training with LoRA")
+    parser.add_argument("--stage1-lr", type=float, default=None,
+                        help="Learning rate for stage 1 (defaults to --lr)")
+    parser.add_argument("--stage2-adapter-lr", type=float, default=None,
+                        help="Learning rate for ECG adapter/proj in stage 2")
+    parser.add_argument("--stage2-lora-lr", type=float, default=None,
+                        help="Learning rate for LoRA params in stage 2")
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--ecg-len", type=int, default=2400)
     parser.add_argument("--downsample", type=int, default=3)
@@ -480,6 +490,7 @@ def parse_args():
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--llm-name", type=str, default=DEFAULT_QWEN_NAME)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--ecg_token_count", type=int, default=16)
     return parser.parse_args()
 
 
@@ -499,11 +510,16 @@ if __name__ == "__main__":
         ecg_len=args.ecg_len,
         downsample=args.downsample,
         batch_size=args.batch_size,
-        num_epochs=args.epochs,
         lr=args.lr,
+        stage1_lr=args.stage1_lr,
         max_length=args.max_length,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         resume=args.resume,
+        ecg_token_count=args.ecg_token_count,
+        stage1_epochs=args.stage1_epochs,
+        stage2_epochs=args.stage2_epochs,
+        stage2_adapter_lr=args.stage2_adapter_lr,
+        stage2_lora_lr=args.stage2_lora_lr,
     )
