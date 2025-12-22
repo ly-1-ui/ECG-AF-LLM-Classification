@@ -17,8 +17,9 @@ python -m src.task2.build_llm_dataset
 llm:
 
 ```shell
-export HF_ENDPOINT=https://hf-mirror.com
-python -m download
+
+# 下载模型和tokenizer到指定目录
+huggingface-cli download Qwen/Qwen2-1.5B-Instruct --local-dir ./models/qwen2-1.5b --local-dir-use-symlinks False
 ```
 
 train:
