@@ -8,6 +8,15 @@ conda env create -f environment.yml
 conda activate ecg
 ```
 
+```conda
+# 下载 64 位版本（默认安装到用户目录，无需管理员权限）
+wget https://repo.anaconda.com/miniconda/Miniconda3-py310_24.3.0-0-Linux-x86_64.sh -O miniconda.sh
+# 运行安装程序
+bash miniconda.sh
+# 适配 bash 终端
+source ~/.bashrc
+```
+
 generate and balance the dataset:
 
 ```shell
